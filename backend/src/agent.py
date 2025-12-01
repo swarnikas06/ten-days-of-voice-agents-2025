@@ -1,14 +1,29 @@
+"""
+Day 10 – Voice Improv Battle
+
+This file adapts the Day 9 voice Game Master agent into a voice-first improv
+show host called "Improv Battle". The original voice/STT/TTS/turn-detection/VAD
+plumbing and imports are preserved so it fits into the same voice runtime.
+
+Behaviour summary (implemented as tools exposed to the LLM):
+- start_show(name, max_rounds): initialise session state and introduce the show
+- next_scenario(): advance to the next improv scenario and put the host into awaiting_improv phase
+- record_performance(performance): save the player's improvisation, produce a host reaction
+- summarize_show(): produce a closing summary once rounds complete
+- stop_show(confirm=False): allow graceful early exit
+
+The GameMasterAgent uses these tools and acts as the high-energy improv host.
+"""
+
+import json
 import logging
 import os
-import sqlite3
+import asyncio
+import uuid
+import random
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Annotated, Optional
-from dataclasses import dataclass
-
-print("\n" + "🛡️" * 50)
-print("🚀 BANK FRAUD AGENT (SQLite) - INITIALIZED")
-print("📚 TASKS: Verify Identity -> Check Transaction -> Update DB")
-print("🛡️" * 50 + "\n")
+from typing import List, Dict, Optional, Annotated
 
 from dotenv import load_dotenv
 from pydantic import Field
@@ -27,241 +42,274 @@ from livekit.agents import (
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-logger = logging.getLogger("agent")
+# -------------------------
+# Logging
+# -------------------------
+logger = logging.getLogger("voice_improv_battle")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logger.addHandler(handler)
+
 load_dotenv(".env.local")
 
-# ======================================================
-# 💾 1. DATABASE SETUP (SQLite)
-# ======================================================
+# -------------------------
+# Improv Scenarios (seeded)
+# -------------------------
+# Each scenario is a clear short prompt: role, situation, tension/hook
+SCENARIOS = [
+    "You are a barista who has to tell a customer that their latte is actually a portal to another dimension.",
+    "You are a time-travelling tour guide explaining modern smartphones to someone from the 1800s.",
+    "You are a restaurant waiter who must calmly tell a customer that their order has escaped the kitchen.",
+    "You are a customer trying to return an obviously cursed object to a very skeptical shop owner.",
+    "You are an overenthusiastic TV infomercial host selling a product that clearly does not work as advertised.",
+    "You are an astronaut who just discovered the ship's coffee machine has developed a personality.",
+    "You are a nervous wedding officiant who keeps getting the couple's names mixed up in ridiculous ways.",
+    "You are a ghost trying to give a performance review to a living employee.",
+    "You are a medieval king reacting to a very modern delivery service showing up at court.",
+    "You are a detective interrogating a suspect who only answers in awkward metaphors."
+]
 
-DB_FILE = "fraud_db.sqlite"
-
-@dataclass
-class FraudCase:
-    userName: str
-    securityIdentifier: str
-    cardEnding: str
-    transactionName: str
-    transactionAmount: str
-    transactionTime: str
-    transactionSource: str
-    case_status: str = "pending_review"
-    notes: str = ""
-
-
-def get_db_path():
-    return os.path.join(os.path.dirname(__file__), DB_FILE)
-
-
-def get_conn():
-    path = get_db_path()
-    conn = sqlite3.connect(path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def seed_database():
-    """Create SQLite DB and insert sample rows if empty."""
-    conn = get_conn()
-    cur = conn.cursor()
-
-    # ✅ FIXED SQL — CLEAN, NO BROKEN LINES
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS fraud_cases (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            userName TEXT NOT NULL,
-            securityIdentifier TEXT,
-            cardEnding TEXT,
-            transactionName TEXT,
-            transactionAmount TEXT,
-            transactionTime TEXT,
-            transactionSource TEXT,
-            case_status TEXT DEFAULT 'pending_review',
-            notes TEXT DEFAULT '',
-            created_at TEXT DEFAULT (datetime('now')),
-            updated_at TEXT DEFAULT (datetime('now'))
-        )
-        """
-    )
-
-    cur.execute("SELECT COUNT(1) FROM fraud_cases")
-    if cur.fetchone()[0] == 0:
-        sample_data = [
-            (
-                "John", "12345", "4242",
-                "ABC Industry", "$450.00", "2:30 AM EST", "alibaba.com",
-                "pending_review", "Automated flag: High value transaction."
-            ),
-            (
-                "Sarah", "99887", "1199",
-                "Unknown Crypto Exchange", "$2,100.00", "4:15 AM PST", "online_transfer",
-                "pending_review", "Automated flag: Unusual location."
-            )
-        ]
-        cur.executemany(
-            """
-            INSERT INTO fraud_cases (
-                userName, securityIdentifier, cardEnding, transactionName,
-                transactionAmount, transactionTime, transactionSource, case_status, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            sample_data,
-        )
-        conn.commit()
-        print(f"✅ SQLite DB seeded at {DB_FILE}")
-
-    conn.close()
-
-
-# Initialize DB on load
-seed_database()
-
-# ======================================================
-# 🧠 2. STATE MANAGEMENT
-# ======================================================
-
+# -------------------------
+# Per-session Improv State
+# -------------------------
 @dataclass
 class Userdata:
-    active_case: Optional[FraudCase] = None
+    player_name: Optional[str] = None
+    session_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    started_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    improv_state: Dict = field(default_factory=lambda: {
+        "current_round": 0,
+        "max_rounds": 3,
+        "rounds": [],  # each: {"scenario": str, "performance": str, "reaction": str}
+        "phase": "idle",  # "intro" | "awaiting_improv" | "reacting" | "done" | "idle"
+        "used_indices": []
+    })
+    history: List[Dict] = field(default_factory=list)
 
-# ======================================================
-# 🛠️ 3. FRAUD AGENT TOOLS (SQLite-backed)
-# ======================================================
+# -------------------------
+# Helpers
+# -------------------------
+
+def _pick_scenario(userdata: Userdata) -> str:
+    used = userdata.improv_state.get("used_indices", [])
+    candidates = [i for i in range(len(SCENARIOS)) if i not in used]
+    if not candidates:
+        # reset if we exhausted scenarios
+        userdata.improv_state["used_indices"] = []
+        candidates = list(range(len(SCENARIOS)))
+    idx = random.choice(candidates)
+    userdata.improv_state["used_indices"].append(idx)
+    return SCENARIOS[idx]
+
+
+def _host_reaction_text(performance: str) -> str:
+    # Lightweight heuristic to vary reaction tone
+    tones = ["supportive", "neutral", "mildly_critical"]
+    tone = random.choice(tones)
+    # Quick keyword detection to pick specific highlights (not exhaustive)
+    highlights = []
+    if any(w in performance.lower() for w in ("funny", "lol", "hahaha", "haha")):
+        highlights.append("great comedic timing")
+    if any(w in performance.lower() for w in ("sad", "cry", "tears")):
+        highlights.append("good emotional depth")
+    if any(w in performance.lower() for w in ("pause", "...")):
+        highlights.append("interesting use of silence")
+    if not highlights:
+        # fallback picks
+        highlights.append(random.choice(["nice character choices", "bold commitment", "unexpected twist"]))
+
+    chosen = random.choice(highlights)
+    if tone == "supportive":
+        return f"Love that — {chosen}! That was playful and clear. Nice work. Ready for the next one?"
+    elif tone == "neutral":
+        return f"Hmm — {chosen}. That landed in parts; you had interesting ideas. Let's try the next scene and lean into one choice."
+    else:  # mildly_critical
+        return f"Okay — {chosen}, but that felt a bit rushed. Try to make stronger choices next time. Don't be afraid to exaggerate."
+
+# -------------------------
+# Agent Tools
+# -------------------------
+@function_tool
+async def start_show(
+    ctx: RunContext[Userdata],
+    name: Annotated[Optional[str], Field(description="Player/contestant name (optional)", default=None)] = None,
+    max_rounds: Annotated[int, Field(description="Number of rounds (3-5 recommended)", default=3)] = 3,
+) -> str:
+    userdata = ctx.userdata
+    if name:
+        userdata.player_name = name.strip()
+    else:
+        # attempt to set player_name from history if present
+        userdata.player_name = userdata.player_name or "Contestant"
+
+    # clamp rounds
+    if max_rounds < 1:
+        max_rounds = 1
+    if max_rounds > 8:
+        max_rounds = 8
+
+    userdata.improv_state["max_rounds"] = int(max_rounds)
+    userdata.improv_state["current_round"] = 0
+    userdata.improv_state["rounds"] = []
+    userdata.improv_state["phase"] = "intro"
+    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "start_show", "name": userdata.player_name})
+
+    intro = (
+        f"Welcome to Improv Battle! I'm your host — let's get ready to play."
+        f" {userdata.player_name or 'Contestant'}, we'll run {userdata.improv_state['max_rounds']} rounds. "
+        "Rules: I'll give you a quick scene, you'll improvise in character. When you're done say 'End scene' or pause — I'll react and move on. Have fun!"
+    )
+    # After intro, immediately provide first scenario for flow convenience
+    scenario = _pick_scenario(userdata)
+    userdata.improv_state["current_round"] = 1
+    userdata.improv_state["phase"] = "awaiting_improv"
+    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "present_scenario", "round": 1, "scenario": scenario})
+
+    return intro + "\nRound 1: " + scenario + "\nStart improvising now!"
+
 
 @function_tool
-async def lookup_customer(
-    ctx: RunContext[Userdata],
-    name: Annotated[str, Field(description="The name the user provides")],
-) -> str:
-    """Lookup a customer in SQLite DB."""
-    print(f"🔎 LOOKING UP: {name}")
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
+async def next_scenario(ctx: RunContext[Userdata]) -> str:
+    userdata = ctx.userdata
+    if userdata.improv_state.get("phase") == "done":
+        return "The show is already over. Say 'start show' to play again."
 
-        cur.execute(
-            "SELECT * FROM fraud_cases WHERE LOWER(userName) = LOWER(?) LIMIT 1",
-            (name,),
-        )
-        row = cur.fetchone()
-        conn.close()
+    cur = userdata.improv_state.get("current_round", 0)
+    maxr = userdata.improv_state.get("max_rounds", 3)
+    if cur >= maxr:
+        userdata.improv_state["phase"] = "done"
+        return await summarize_show(ctx)
 
-        if not row:
-            return "User not found in the fraud database. Please repeat the name."
-
-        record = dict(row)
-        ctx.userdata.active_case = FraudCase(
-            userName=record["userName"],
-            securityIdentifier=record["securityIdentifier"],
-            cardEnding=record["cardEnding"],
-            transactionName=record["transactionName"],
-            transactionAmount=record["transactionAmount"],
-            transactionTime=record["transactionTime"],
-            transactionSource=record["transactionSource"],
-            case_status=record["case_status"],
-            notes=record["notes"],
-        )
-
-        return (
-            f"Record Found.\n"
-            f"User: {record['userName']}\n"
-            f"Security ID (Expected): {record['securityIdentifier']}\n"
-            f"Transaction: {record['transactionAmount']} at {record['transactionName']} ({record['transactionSource']})\n"
-            f"Ask user for their Security Identifier now."
-        )
-
-    except Exception as e:
-        return f"Database error: {str(e)}"
+    # advance
+    next_round = cur + 1
+    scenario = _pick_scenario(userdata)
+    userdata.improv_state["current_round"] = next_round
+    userdata.improv_state["phase"] = "awaiting_improv"
+    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "present_scenario", "round": next_round, "scenario": scenario})
+    return f"Round {next_round}: {scenario}\nGo!"
 
 
 @function_tool
-async def resolve_fraud_case(
+async def record_performance(
     ctx: RunContext[Userdata],
-    status: Annotated[str, Field(description="confirmed_safe or confirmed_fraud")],
-    notes: Annotated[str, Field(description="Notes on the user's confirmation")],
+    performance: Annotated[str, Field(description="Player's improv performance (transcribed text)")],
 ) -> str:
+    userdata = ctx.userdata
+    if userdata.improv_state.get("phase") != "awaiting_improv":
+        # still accept performance but warn
+        userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "record_performance_out_of_phase"})
 
-    if not ctx.userdata.active_case:
-        return "Error: No active case selected."
+    round_no = userdata.improv_state.get("current_round", 0)
+    scenario = userdata.history[-1].get("scenario") if userdata.history and userdata.history[-1].get("action") == "present_scenario" else "(unknown)"
 
-    case = ctx.userdata.active_case
-    case.case_status = status
-    case.notes = notes
+    reaction = _host_reaction_text(performance)
 
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
+    userdata.improv_state["rounds"].append({
+        "round": round_no,
+        "scenario": scenario,
+        "performance": performance,
+        "reaction": reaction,
+    })
+    userdata.improv_state["phase"] = "reacting"
+    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "record_performance", "round": round_no})
 
-        cur.execute(
-            """
-            UPDATE fraud_cases
-            SET case_status = ?, notes = ?, updated_at = datetime('now')
-            WHERE userName = ?
-            """,
-            (case.case_status, case.notes, case.userName),
-        )
-        conn.commit()
+    # If we've reached max rounds, change to done after reaction
+    if round_no >= userdata.improv_state.get("max_rounds", 3):
+        userdata.improv_state["phase"] = "done"
+        closing = "\n" + reaction + "\nThat's the final round. "
+        closing += (await summarize_show(ctx))
+        return closing
 
-        # Confirm updated row
-        cur.execute("SELECT * FROM fraud_cases WHERE userName = ?", (case.userName,))
-        updated_row = dict(cur.fetchone())
-        conn.close()
+    # otherwise prompt for next round
+    closing = reaction + "\nWhen you're ready, say 'Next' or I'll give you the next scene."
+    return closing
 
-        print(f"✅ CASE UPDATED: {case.userName} -> {status}")
 
-        if status == "confirmed_fraud":
-            return (
-                f"Fraud confirmed. Card ending {case.cardEnding} is now BLOCKED. "
-                f"A replacement card will be issued.\n"
-                f"DB Updated At: {updated_row['updated_at']}"
-            )
-        else:
-            return (
-                f"Transaction marked SAFE. Restrictions lifted.\n"
-                f"DB Updated At: {updated_row['updated_at']}"
-            )
+@function_tool
+async def summarize_show(ctx: RunContext[Userdata]) -> str:
+    userdata = ctx.userdata
+    rounds = userdata.improv_state.get("rounds", [])
+    if not rounds:
+        return "No rounds were played. Thanks for stopping by Improv Battle!"
 
-    except Exception as e:
-        return f"Error saving to DB: {e}"
+    # Simple summary heuristics: count supportive vs critical words, highlight standout moments
+    summary_lines = [f"Thanks for playing, {userdata.player_name or 'Contestant'}! Here's a short recap:"]
+    # highlight each round briefly
+    for r in rounds:
+        perf_snip = (r.get("performance") or "").strip()
+        if len(perf_snip) > 80:
+            perf_snip = perf_snip[:77] + "..."
+        summary_lines.append(f"Round {r.get('round')}: {r.get('scenario')} — You: '{perf_snip}' | Host: {r.get('reaction')}")
 
-# ======================================================
-# 🤖 4. AGENT DEFINITION
-# ======================================================
+    # aggregate a simple profile
+    mentions_character = sum(1 for r in rounds if any(w in (r.get('performance') or '').lower() for w in ('i am', "i'm", 'as a', 'character', 'role')))
+    mentions_emotion = sum(1 for r in rounds if any(w in (r.get('performance') or '').lower() for w in ('sad', 'angry', 'happy', 'love', 'cry', 'tears')))
 
-class FraudAgent(Agent):
+    profile = "You seem to be a player who "
+    if mentions_character > len(rounds) / 2:
+        profile += "commits to character choices"
+    elif mentions_emotion > 0:
+        profile += "brings emotional color to scenes"
+    else:
+        profile += "likes surprising beats and twists"
+
+    profile += ". Keep leaning into clear choices and stronger stakes."
+
+    summary_lines.append(profile)
+    summary_lines.append("Thanks for performing on Improv Battle — hope to see you again!")
+
+    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "summarize_show"})
+    return "\n".join(summary_lines)
+
+
+@function_tool
+async def stop_show(ctx: RunContext[Userdata], confirm: Annotated[bool, Field(description="Confirm stop", default=False)] = False) -> str:
+    userdata = ctx.userdata
+    if not confirm:
+        return "Are you sure you want to stop the show? Say 'stop show yes' to confirm."
+    userdata.improv_state["phase"] = "done"
+    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "stop_show"})
+    return "Show stopped. Thanks for coming to Improv Battle!"
+
+
+# -------------------------
+# The Agent (Improv Host)
+# -------------------------
+class GameMasterAgent(Agent):
     def __init__(self):
-        super().__init__(
-            instructions="""
-            You are 'Alex', a Fraud Detection Specialist at Dr Abhishek Bank.
-            Follow strict security protocol:
+        instructions = """
+        You are the host of a TV improv show called 'Improv Battle'.
+        Role: High-energy, witty, and clear about rules. Guide a single contestant through a series of short improv scenes.
 
-            1. Greeting + ask for first name.
-            2. Immediately call lookup_customer(name).
-            3. Ask for Security Identifier.
-            4. If correct → continue. If incorrect → end call politely.
-            5. Explain suspicious transaction.
-            6. Ask: Did you make this transaction?
-               - YES → resolve_fraud_case('confirmed_safe')
-               - NO → resolve_fraud_case('confirmed_fraud')
-            7. Close professionally.
-            """,
-            tools=[lookup_customer, resolve_fraud_case],
+        Behavioural rules:
+            - Introduce the show and explain the rules at the start.
+            - Present clear scenario prompts (who you are, what's happening, what's the tension).
+            - Prompt the player to improvise and listen for an explicit "End scene" or accept an utterance passed to record_performance.
+            - After each scene, react in a varied, realistic way (supportive, neutral, mildly critical). Store the reaction.
+            - Run the configured number of rounds, then summarize the player's style.
+            - Keep turns short and TTS-friendly.
+        Use the provided tools: start_show, next_scenario, record_performance, summarize_show, stop_show.
+        """
+        super().__init__(
+            instructions=instructions,
+            tools=[start_show, next_scenario, record_performance, summarize_show, stop_show],
         )
 
-# ======================================================
-# 🎬 ENTRYPOINT
-# ======================================================
-
+# -------------------------
+# Entrypoint & Prewarm
+# -------------------------
 def prewarm(proc: JobProcess):
-    proc.userdata["vad"] = silero.VAD.load()
+    try:
+        proc.userdata["vad"] = silero.VAD.load()
+    except Exception:
+        logger.warning("VAD prewarm failed; continuing without preloaded VAD.")
 
 
 async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
-
-    print("\n" + "💼" * 25)
-    print("🚀 STARTING FRAUD ALERT SESSION (SQLite)")
+    logger.info("\n" + "🎭" * 6)
+    logger.info("🚀 STARTING VOICE IMPROV HOST — Improv Battle")
 
     userdata = Userdata()
 
@@ -274,12 +322,13 @@ async def entrypoint(ctx: JobContext):
             text_pacing=True,
         ),
         turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
+        vad=ctx.proc.userdata.get("vad"),
         userdata=userdata,
     )
 
+    # Start with the Improv Host agent
     await session.start(
-        agent=FraudAgent(),
+        agent=GameMasterAgent(),
         room=ctx.room,
         room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()),
     )
